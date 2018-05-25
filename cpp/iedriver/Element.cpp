@@ -188,6 +188,53 @@ bool Element::IsInteractable() {
   return result;
 }
 
+bool Element::IsFocusable() {
+  LOG(TRACE) << "Entering Element::IsFocusable";
+
+  bool result = false;
+
+  CComPtr<IHTMLBodyElement> body;
+  HRESULT hr = this->element_->QueryInterface<IHTMLBodyElement>(&body);
+  if (SUCCEEDED(hr) && body) {
+    // The <body> element is explicitly focusable.
+    return true;
+  }
+
+  CComPtr<IHTMLDocument2> doc;
+  this->GetContainingDocument(false, &doc);
+
+  CComPtr<IHTMLDocument3> document_element_doc;
+  hr = doc->QueryInterface<IHTMLDocument3>(&document_element_doc);
+  if (SUCCEEDED(hr) && document_element_doc) {
+    CComPtr<IHTMLElement> doc_element;
+    hr = document_element_doc->get_documentElement(&doc_element);
+    if (SUCCEEDED(hr) && doc_element && this->element_.IsEqualObject(doc_element)) {
+      // The document's documentElement is explicitly focusable.
+      return true;
+    }
+  }
+
+  // The atom is just the definition of an anonymous
+  // function: "function() {...}"; Wrap it in another function so we can
+  // invoke it with our arguments without polluting the current namespace.
+  std::wstring script_source(L"(function() { return (");
+  script_source += atoms::asString(atoms::IS_FOCUSABLE);
+  script_source += L")})();";
+
+  
+  Script script_wrapper(doc, script_source, 1);
+  script_wrapper.AddArgument(this->element_);
+  int status_code = script_wrapper.Execute();
+
+  if (status_code == WD_SUCCESS) {
+    result = script_wrapper.result().boolVal == VARIANT_TRUE;
+  } else {
+    LOG(WARN) << "Failed to determine is element enabled";
+  }
+
+  return result;
+}
+
 bool Element::IsObscured(LocationInfo* click_location,
                          std::string* obscuring_element_description) {
   CComPtr<ISVGElement> svg_element;
@@ -200,10 +247,38 @@ bool Element::IsObscured(LocationInfo* click_location,
   }
 
   bool is_obscured = false;
-  int status_code = this->GetStaticClickLocation(click_location);
 
   CComPtr<IHTMLDocument2> doc;
   this->GetContainingDocument(false, &doc);
+
+  std::vector<LocationInfo> frame_locations;
+  LocationInfo element_location = {};
+  int status_code = this->GetLocation(&element_location, &frame_locations);
+  bool document_contains_frames = frame_locations.size() != 0;
+  *click_location = this->CalculateClickPoint(element_location,
+                                              document_contains_frames);
+  long x = click_location->x;
+  long y = click_location->y;
+  if (document_contains_frames) {
+    // If the document contains frames, we'll need to do elementsFromPoint
+    // for the framed document, ignoring the frame offsets.
+    CComPtr<IHTMLElement2> rect_element;
+    this->element_->QueryInterface<IHTMLElement2>(&rect_element);
+    CComPtr<IHTMLRect> rect;
+    rect_element->getBoundingClientRect(&rect);
+    long top = 0, bottom = 0, left = 0, right = 0;
+
+    rect->get_top(&top);
+    rect->get_left(&left);
+    rect->get_bottom(&bottom);
+    rect->get_right(&right);
+
+    long width = right - left;
+    long height = bottom - top;
+
+    x = left + (width / 2);
+    y = top + (height / 2);
+  }
 
   CComPtr<IHTMLDocument8> elements_doc;
   hr = doc.QueryInterface<IHTMLDocument8>(&elements_doc);
@@ -215,9 +290,10 @@ bool Element::IsObscured(LocationInfo* click_location,
     return false;
   }
 
+  long top_most_element_index = -1;
   CComPtr<IHTMLDOMChildrenCollection> elements_hit;
-  hr = elements_doc->elementsFromPoint(static_cast<float>(click_location->x),
-                                       static_cast<float>(click_location->y),
+  hr = elements_doc->elementsFromPoint(static_cast<float>(x),
+                                       static_cast<float>(y),
                                        &elements_hit);
   if (SUCCEEDED(hr) && elements_hit != NULL) {
     long element_count;
@@ -229,26 +305,32 @@ bool Element::IsObscured(LocationInfo* click_location,
       CComPtr<IHTMLElement> element_in_list;
       hr = dispatch_in_list->QueryInterface<IHTMLElement>(&element_in_list);
       bool are_equal = element_in_list.IsEqualObject(this->element_);
-      if (index == 0) {
-        // Return the top-most element in the event we find an obscuring
-        // element in the tree between this element and the top-most one.
-        // Note that since it's the top-most element, it will have no
-        // descendants, so its outerHTML property will contain only itself.
-        CComBSTR outer_html_bstr;
-        hr = element_in_list->get_outerHTML(&outer_html_bstr);
-        std::wstring outer_html = outer_html_bstr;
-        *obscuring_element_description = StringUtilities::ToString(outer_html);
+      if (are_equal) {
+        break;
       }
 
-    
-      VARIANT_BOOL is_child;
-      hr = this->element_->contains(element_in_list, &is_child);
-      VARIANT_BOOL is_ancestor;
-      hr = element_in_list->contains(this->element_, &is_ancestor);
-      is_obscured = is_obscured ||
-                    (is_child != VARIANT_TRUE && is_ancestor != VARIANT_TRUE);
-      if (is_obscured || are_equal) {
-        break;
+      bool is_list_element_displayed;
+      Element element_wrapper(element_in_list,
+                                   this->containing_window_handle_);
+      status_code = element_wrapper.IsDisplayed(false,
+                                                &is_list_element_displayed);
+      if (is_list_element_displayed) {
+        VARIANT_BOOL is_child;
+        hr = this->element_->contains(element_in_list, &is_child);
+        VARIANT_BOOL is_ancestor;
+        hr = element_in_list->contains(this->element_, &is_ancestor);
+        is_obscured = is_child != VARIANT_TRUE && is_ancestor != VARIANT_TRUE;
+        if (is_obscured) {
+          // Return the top-most element in the event we find an obscuring
+          // element in the tree between this element and the top-most one.
+          // Note that since it's the top-most element, it will have no
+          // descendants, so its outerHTML property will contain only itself.
+          CComBSTR outer_html_bstr;
+          hr = element_in_list->get_outerHTML(&outer_html_bstr);
+          std::wstring outer_html = outer_html_bstr;
+          *obscuring_element_description = StringUtilities::ToString(outer_html);
+          break;
+        }
       }
     }
   }
@@ -934,11 +1016,13 @@ bool Element::GetClickableViewPortLocation(const bool document_contains_frames, 
     CComPtr<IHTMLDocument2> doc;
     this->GetContainingDocument(false, &doc);
     int document_mode = DocumentHost::GetDocumentMode(doc);
-    CComPtr<IHTMLDocument3> document_element_doc;
+    CComPtr<IHTMLDocument3> document_element_doc;		
+    CComPtr<IHTMLElement> document_element;
     HRESULT hr = doc->QueryInterface<IHTMLDocument3>(&document_element_doc);
-    if (SUCCEEDED(hr) && document_element_doc && document_mode > 5) {
-      CComPtr<IHTMLElement> document_element;
+    if (SUCCEEDED(hr) && document_element_doc) { 
       hr = document_element_doc->get_documentElement(&document_element);
+    }
+    if (SUCCEEDED(hr) && document_mode > 5 && document_element) {
       CComPtr<IHTMLElement2> size_element;
       hr = document_element->QueryInterface<IHTMLElement2>(&size_element);
       size_element->get_clientHeight(&window_height);
